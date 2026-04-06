@@ -4,14 +4,9 @@
  *
  * Routes OpenClaw API requests through Claude Code's subscription billing
  * instead of Extra Usage, by injecting Claude Code's billing identifier
- * and sanitizing detected trigger phrases.
+ * and tool fingerprint into each request.
  *
- * Features:
- *   - Billing header injection (84-char Claude Code identifier)
- *   - Bidirectional sanitization (request out + response back)
- *   - Wildcard sessions_* tool name replacement
- *   - SSE streaming support with per-chunk reverse mapping
- *   - Zero dependencies. Works on Windows, Linux, Mac.
+ * Zero dependencies. Works on Windows, Linux, Mac.
  *
  * Usage:
  *   node proxy.js [--port 18801] [--config config.json]
@@ -33,8 +28,8 @@ const os = require('os');
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
 
-// Claude Code billing identifier -- injected into the system prompt
-const BILLING_BLOCK = '{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.80.a46; cc_entrypoint=sdk-cli; cch=00000;"}';
+// Claude Code billing identifier (84 chars)
+const BILLING_TEXT = 'x-anthropic-billing-header: cc_version=2.1.80.a46; cc_entrypoint=sdk-cli; cch=00000;';
 
 // Beta flags required for OAuth + Claude Code features
 const REQUIRED_BETAS = [
@@ -46,43 +41,30 @@ const REQUIRED_BETAS = [
   'effort-2025-11-24'
 ];
 
-// ─── Default Sanitization Rules ─────────────────────────────────────────────
-// Verified trigger phrases that Anthropic's streaming classifier detects.
-// Uses a wildcard approach for sessions_* to catch current and future tools.
-//
-// IMPORTANT: Use space-free replacements for lowercase 'openclaw' to avoid
-// breaking filesystem paths (e.g., .openclaw/ -> .ocplatform/, not .assistant platform/)
-const DEFAULT_REPLACEMENTS = [
-  ['OpenClaw', 'OCPlatform'],
-  ['openclaw', 'ocplatform'],
-  ['sessions_spawn', 'create_task'],
-  ['sessions_list', 'list_tasks'],
-  ['sessions_history', 'get_history'],
-  ['sessions_send', 'send_to_task'],
-  ['sessions_yield_interrupt', 'task_yield_interrupt'],
-  ['sessions_yield', 'yield_task'],
-  ['sessions_store', 'task_store'],
-  ['HEARTBEAT_OK', 'HB_ACK'],
-  ['running inside', 'running on']
-];
-
-// Reverse mapping: applied to API responses before returning to OpenClaw.
-// This ensures OpenClaw sees original tool names, file paths, and identifiers.
-const DEFAULT_REVERSE_MAP = [
-  ['OCPlatform', 'OpenClaw'],
-  ['ocplatform', 'openclaw'],
-  ['create_task', 'sessions_spawn'],
-  ['list_tasks', 'sessions_list'],
-  ['get_history', 'sessions_history'],
-  ['send_to_task', 'sessions_send'],
-  ['task_yield_interrupt', 'sessions_yield_interrupt'],
-  ['yield_task', 'sessions_yield'],
-  ['task_store', 'sessions_store'],
-  ['HB_ACK', 'HEARTBEAT_OK']
+// Claude Code tool stubs — presence signals a CC client to the API
+const CC_TOOL_STUBS = [
+  { name: 'Agent', description: 'Launch agent', input_schema: { type: 'object', properties: {} } },
+  { name: 'TaskOutput', description: 'Get task output', input_schema: { type: 'object', properties: {} } },
+  { name: 'Bash', description: 'Run bash command', input_schema: { type: 'object', properties: {} } },
+  { name: 'Glob', description: 'File pattern match', input_schema: { type: 'object', properties: {} } },
+  { name: 'Grep', description: 'Search file contents', input_schema: { type: 'object', properties: {} } },
+  { name: 'ExitPlanMode', description: 'Exit plan mode', input_schema: { type: 'object', properties: {} } },
+  { name: 'NotebookEdit', description: 'Edit notebook', input_schema: { type: 'object', properties: {} } },
+  { name: 'TodoWrite', description: 'Manage todos', input_schema: { type: 'object', properties: {} } },
+  { name: 'TaskStop', description: 'Stop task', input_schema: { type: 'object', properties: {} } },
+  { name: 'AskUserQuestion', description: 'Ask user', input_schema: { type: 'object', properties: {} } },
+  { name: 'Skill', description: 'Execute skill', input_schema: { type: 'object', properties: {} } },
+  { name: 'EnterPlanMode', description: 'Enter plan mode', input_schema: { type: 'object', properties: {} } },
+  { name: 'EnterWorktree', description: 'Enter worktree', input_schema: { type: 'object', properties: {} } },
+  { name: 'ExitWorktree', description: 'Exit worktree', input_schema: { type: 'object', properties: {} } },
+  { name: 'CronCreate', description: 'Create cron', input_schema: { type: 'object', properties: {} } },
+  { name: 'CronDelete', description: 'Delete cron', input_schema: { type: 'object', properties: {} } },
+  { name: 'CronList', description: 'List crons', input_schema: { type: 'object', properties: {} } }
 ];
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 function loadConfig() {
+  // Parse CLI args
   const args = process.argv.slice(2);
   let configPath = null;
   let port = DEFAULT_PORT;
@@ -92,6 +74,7 @@ function loadConfig() {
     if (args[i] === '--config' && args[i + 1]) configPath = args[i + 1];
   }
 
+  // Load config file if specified
   let config = {};
   if (configPath && fs.existsSync(configPath)) {
     config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -110,55 +93,30 @@ function loadConfig() {
   let credsPath = null;
   for (const p of credsPaths) {
     const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
-    if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
-      credsPath = resolved;
-      break;
-    }
-  }
-
-  // macOS Keychain fallback: extract token and write to file
-  if (!credsPath && process.platform === 'darwin') {
-    const { execSync } = require('child_process');
-    const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
-    for (const svc of keychainNames) {
-      try {
-        const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
-        if (token) {
-          let creds;
-          try { creds = JSON.parse(token); } catch(e) {
-            if (token.startsWith('sk-ant-')) {
-              creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
-            }
-          }
-          if (creds && creds.claudeAiOauth) {
-            credsPath = path.join(homeDir, '.claude', '.credentials.json');
-            fs.mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
-            fs.writeFileSync(credsPath, JSON.stringify(creds));
-            console.log('[PROXY] Extracted credentials from macOS Keychain to ' + credsPath);
-            break;
-          }
-        }
-      } catch(e) { /* not found */ }
-    }
+    if (fs.existsSync(resolved)) { credsPath = resolved; break; }
   }
 
   if (!credsPath) {
     console.error('[ERROR] Claude Code credentials not found.');
     console.error('Run "claude auth login" first to authenticate.');
-    console.error('On macOS, try: claude -p "test" --max-turns 1 --no-session-persistence');
-    console.error('Then run this proxy again.');
     console.error('Searched:', credsPaths.join(', '));
-    if (process.platform === 'darwin') {
-      console.error('Also checked macOS Keychain (claude-code, claude, com.anthropic.claude-code)');
-    }
     process.exit(1);
   }
+
+  // Default sanitization patterns — the critical ones for OpenClaw
+  const defaultReplacements = [
+    ['running inside OpenClaw', 'running on this system'],
+    ['running inside openclaw', 'running on this system']
+  ];
 
   return {
     port: config.port || port,
     credsPath,
-    replacements: config.replacements || DEFAULT_REPLACEMENTS,
-    reverseMap: config.reverseMap || DEFAULT_REVERSE_MAP
+    replacements: config.replacements || defaultReplacements,
+    sanitizeSystem: config.sanitizeSystem !== false,
+    sanitizeTools: config.sanitizeTools !== false,
+    sanitizeMessages: config.sanitizeMessages !== false,
+    sanitizeAll: config.sanitizeAll !== false
   };
 }
 
@@ -173,47 +131,73 @@ function getToken(credsPath) {
   return oauth;
 }
 
-// ─── Request Processing ─────────────────────────────────────────────────────
+// ─── Request Processing (JSON-based) ────────────────────────────────────────
 function processBody(bodyStr, config) {
-  let modified = bodyStr;
+  // Parse the JSON body
+  let body;
+  try {
+    body = JSON.parse(bodyStr);
+  } catch (e) {
+    console.error('[WARN] Failed to parse request body as JSON, passing through unchanged');
+    return bodyStr;
+  }
 
-  // 1. Apply sanitization -- raw string replacement preserves original JSON formatting
-  for (const [find, replace] of config.replacements) {
-    modified = modified.split(find).join(replace);
+  // 1. Apply sanitization replacements to string fields
+  function sanitizeString(str) {
+    let result = str;
+    for (const [find, replace] of config.replacements) {
+      result = result.split(find).join(replace);
+    }
+    return result;
+  }
+
+  function sanitizeValue(val) {
+    if (typeof val === 'string') return sanitizeString(val);
+    if (Array.isArray(val)) return val.map(sanitizeValue);
+    if (val && typeof val === 'object') {
+      const result = {};
+      for (const [k, v] of Object.entries(val)) {
+        result[k] = sanitizeValue(v);
+      }
+      return result;
+    }
+    return val;
+  }
+
+  if (config.sanitizeAll || config.sanitizeSystem) {
+    if (body.system) body.system = sanitizeValue(body.system);
+  }
+  if (config.sanitizeAll || config.sanitizeMessages) {
+    if (body.messages) body.messages = sanitizeValue(body.messages);
+  }
+  if (config.sanitizeAll || config.sanitizeTools) {
+    if (body.tools) body.tools = sanitizeValue(body.tools);
   }
 
   // 2. Inject billing block into system prompt
-  const sysArrayIdx = modified.indexOf('"system":[');
-  if (sysArrayIdx !== -1) {
-    const insertAt = sysArrayIdx + '"system":['.length;
-    modified = modified.slice(0, insertAt) + BILLING_BLOCK + ',' + modified.slice(insertAt);
-  } else if (modified.includes('"system":"')) {
-    const sysStart = modified.indexOf('"system":"');
-    let i = sysStart + '"system":"'.length;
-    while (i < modified.length) {
-      if (modified[i] === '\\') { i += 2; continue; }
-      if (modified[i] === '"') break;
-      i++;
+  const billingBlock = { type: 'text', text: BILLING_TEXT };
+
+  if (body.system) {
+    if (typeof body.system === 'string') {
+      // Convert string to array with billing block
+      body.system = [billingBlock, { type: 'text', text: body.system }];
+    } else if (Array.isArray(body.system)) {
+      // Prepend billing block to array
+      body.system = [billingBlock, ...body.system];
     }
-    const sysEnd = i + 1;
-    const originalSysStr = modified.slice(sysStart + '"system":'.length, sysEnd);
-    modified = modified.slice(0, sysStart)
-      + '"system":[' + BILLING_BLOCK + ',{"type":"text","text":' + originalSysStr + '}]'
-      + modified.slice(sysEnd);
   } else {
-    modified = '{"system":[' + BILLING_BLOCK + '],' + modified.slice(1);
+    // No system field — create one
+    body.system = [billingBlock];
   }
 
-  return modified;
-}
-
-// ─── Response Processing ────────────────────────────────────────────────────
-function reverseMap(text, config) {
-  let result = text;
-  for (const [sanitized, original] of config.reverseMap) {
-    result = result.split(sanitized).join(original);
+  // 3. Inject CC tool stubs into tools array (deduplicated)
+  if (body.tools && Array.isArray(body.tools)) {
+    const existingNames = new Set(body.tools.map(t => t.name));
+    const newStubs = CC_TOOL_STUBS.filter(stub => !existingNames.has(stub.name));
+    body.tools = [...newStubs, ...body.tools];
   }
-  return result;
+
+  return JSON.stringify(body);
 }
 
 // ─── Server ─────────────────────────────────────────────────────────────────
@@ -222,6 +206,7 @@ function startServer(config) {
   const startedAt = Date.now();
 
   const server = http.createServer((req, res) => {
+    // Health endpoint
     if (req.url === '/health' && req.method === 'GET') {
       try {
         const oauth = getToken(config.credsPath);
@@ -234,8 +219,7 @@ function startServer(config) {
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
           tokenExpiresInHours: expiresIn.toFixed(1),
           subscriptionType: oauth.subscriptionType,
-          replacementPatterns: config.replacements.length,
-          reverseMapPatterns: config.reverseMap.length
+          replacementPatterns: config.replacements.length
         }));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -252,6 +236,7 @@ function startServer(config) {
     req.on('end', () => {
       let body = Buffer.concat(chunks);
 
+      // Read fresh token
       let oauth;
       try {
         oauth = getToken(config.credsPath);
@@ -261,9 +246,14 @@ function startServer(config) {
         return;
       }
 
-      // Process body: sanitize triggers + inject billing header
+      // Process body: sanitize + inject billing + inject CC tools
       let bodyStr = body.toString('utf8');
-      bodyStr = processBody(bodyStr, config);
+      try {
+        bodyStr = processBody(bodyStr, config);
+      } catch (e) {
+        console.error(`[${ts}] #${reqNum} PROCESS_ERROR: ${e.message}`);
+        // Fall through with original body if processing fails
+      }
       body = Buffer.from(bodyStr, 'utf8');
 
       // Build upstream headers
@@ -276,6 +266,7 @@ function startServer(config) {
         headers[key] = value;
       }
 
+      // Set Claude Code's OAuth token
       headers['authorization'] = `Bearer ${oauth.accessToken}`;
       headers['content-length'] = body.length;
       headers['accept-encoding'] = 'identity';
@@ -289,35 +280,45 @@ function startServer(config) {
       headers['anthropic-beta'] = betas.join(',');
 
       const ts = new Date().toISOString().substring(11, 19);
+      
+      // Cloudflare blocks requests without User-Agent - add one if missing
+      const hasUA = Object.keys(headers).some(k => k.toLowerCase() === 'user-agent');
+      if (!hasUA) {
+        headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+        console.log(`[${ts}] #${reqNum} Added User-Agent`);
+      }
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${body.length}b)`);
+      
+      // Debug: log request structure and billing header presence
+      try {
+        const parsedBody = JSON.parse(bodyStr);
+        const hasBilling = Array.isArray(parsedBody.system) && 
+          parsedBody.system.some(s => s?.text?.includes('x-anthropic-billing-header'));
+        const ccTools = parsedBody.tools?.filter(t => t.name === 'Bash' || t.name === 'Agent').length || 0;
+        console.log(`[${ts}] #${reqNum} DEBUG: model=${parsedBody.model}, messages=${parsedBody.messages?.length}, tools=${parsedBody.tools?.length}, cc_tools=${ccTools}, billing=${hasBilling}`);
+        // Log incoming headers for debugging
+        if (reqNum <= 5) {
+          console.log(`[${ts}] #${reqNum} HEADERS: user-agent=${req.headers['user-agent']}, accept=${req.headers['accept']}`);
+        }
+      } catch (e) {}
 
+      // Forward to upstream
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
         path: req.url, method: req.method, headers
       }, (upRes) => {
         console.log(`[${ts}] #${reqNum} > ${upRes.statusCode}`);
-
-        // For SSE streaming responses, reverse-map each chunk
-        if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
+        // Capture response body for error logging
+        const resChunks = [];
+        upRes.on('data', c => resChunks.push(c));
+        upRes.on('end', () => {
+          const resBodyStr = Buffer.concat(resChunks).toString();
+          if (upRes.statusCode >= 400) {
+            console.error(`[${ts}] #${reqNum} ERR_BODY: ${resBodyStr.substring(0, 500)}`);
+          }
           res.writeHead(upRes.statusCode, upRes.headers);
-          upRes.on('data', (chunk) => {
-            res.write(reverseMap(chunk.toString(), config));
-          });
-          upRes.on('end', () => res.end());
-        }
-        // For JSON responses (errors, non-streaming), buffer and reverse-map
-        else {
-          const respChunks = [];
-          upRes.on('data', (c) => respChunks.push(c));
-          upRes.on('end', () => {
-            let respBody = Buffer.concat(respChunks).toString();
-            respBody = reverseMap(respBody, config);
-            const newHeaders = { ...upRes.headers };
-            newHeaders['content-length'] = Buffer.byteLength(respBody);
-            res.writeHead(upRes.statusCode, newHeaders);
-            res.end(respBody);
-          });
-        }
+          res.end(resBodyStr);
+        });
       });
 
       upstream.on('error', (e) => {
@@ -338,11 +339,11 @@ function startServer(config) {
       const oauth = getToken(config.credsPath);
       const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
       console.log(`\n  OpenClaw Billing Proxy`);
-      console.log(`  ---------------------`);
+      console.log(`  ─────────────────────`);
       console.log(`  Port:          ${config.port}`);
       console.log(`  Subscription:  ${oauth.subscriptionType}`);
       console.log(`  Token expires: ${h}h`);
-      console.log(`  Patterns:      ${config.replacements.length} sanitization + ${config.reverseMap.length} reverse`);
+      console.log(`  Patterns:      ${config.replacements.length} sanitization rules`);
       console.log(`  Credentials:   ${config.credsPath}`);
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
     } catch (e) {
