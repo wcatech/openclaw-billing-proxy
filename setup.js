@@ -12,6 +12,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+// Default counts for display (must match proxy.js)
+const DEFAULT_REPLACEMENTS_COUNT = 30;
+const DEFAULT_TOOL_RENAMES_COUNT = 28;
+
 const homeDir = os.homedir();
 
 console.log('\n  OpenClaw Billing Proxy Setup');
@@ -50,7 +54,7 @@ if (!creds && process.platform === 'darwin') {
   const { execSync } = require('child_process');
 
   // Try common Keychain service names
-  const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
+  const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
   let keychainToken = null;
 
   for (const svc of keychainNames) {
@@ -138,7 +142,7 @@ if (!creds) {
   console.error('   Searched for credentials at:');
   for (const p of credsPaths) { console.error('     ' + p); }
   if (process.platform === 'darwin') {
-    console.error('     macOS Keychain (claude-code, claude, com.anthropic.claude-code)');
+    console.error('     macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code)');
   }
   console.error('');
   console.error('   If claude auth status shows you are logged in but no file exists,');
@@ -319,18 +323,22 @@ if (oclawPath) {
 // Step 4: Generate config
 console.log('\n4. Generating configuration...');
 
+// Only write port and credentialsPath to config.json.
+// Pattern arrays (replacements, reverseMap, toolRenames, propRenames) are NOT
+// written — they use the defaults from proxy.js which stay current across
+// updates. Users can add custom patterns to config.json and they'll be MERGED
+// with defaults automatically. (see issue #24)
 const config = {
   port: 18801,
   credentialsPath: credsPath,
-  replacements: replacements,
-  reverseMap: reverseMap
+  _comment: 'Pattern arrays use proxy.js defaults. Add custom entries to replacements/reverseMap/toolRenames and they will be merged with defaults automatically.'
 };
 
 const configPath = path.join(process.cwd(), 'config.json');
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 console.log('   Written: ' + configPath);
-console.log('   Sanitization patterns: ' + replacements.length);
-console.log('   Reverse map patterns: ' + reverseMap.length);
+console.log('   Default sanitization: ' + DEFAULT_REPLACEMENTS_COUNT + ' string + ' + DEFAULT_TOOL_RENAMES_COUNT + ' tool renames (from proxy.js)');
+console.log('   Custom patterns can be added to config.json and will be merged with defaults.');
 
 // Step 5: Instructions
 console.log('\n5. Setup complete!\n');
